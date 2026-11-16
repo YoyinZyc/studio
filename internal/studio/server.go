@@ -1,0 +1,530 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package studio serves the local AX Studio Web UI and Backend-for-Frontend
+// (BFF) API on 127.0.0.1.
+package studio
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/agentexecutor/studio/internal/kube"
+	"github.com/google/ax/pkg/apis/v1alpha1"
+)
+
+const (
+	// DefaultAddr is the loopback address AX Studio binds to by default.
+	DefaultAddr       = "127.0.0.1:8080"
+	sessionCookieName = "ax_studio_session"
+	csrfHeaderName    = "X-AX-CSRF-Token"
+	sessionTTL        = 12 * time.Hour
+	maxJSONBodyBytes  = 2 * 1024 * 1024 // 2 MiB cap for YAML manifests / API requests
+)
+
+// Options configures a local AX Studio server instance.
+type Options struct {
+	Addr          string
+	AXNamespace   string
+	AXBinary      string
+	StaticFS      fs.FS
+	Runner        kube.Runner
+	ResolveServer ServerResolver
+	GuestExec     GuestExecFunc
+	OnListening   func(boundURL string)
+	OnShutdown    func()
+}
+
+// Server hosts the AX Studio embedded web app and loopback API endpoints.
+//
+// TODO(security): Multi-user OAuth/OIDC, MFA, password hashing, and malware/CDR
+// file-upload scanning are intentionally omitted because `ax-studio` is a
+// single-user local loopback CLI process (127.0.0.1) with no user database or
+// arbitrary file-upload storage, authenticated via per-process 256-bit
+// cryptographic session + CSRF tokens.
+type Server struct {
+	addr           string
+	axNamespace    string
+	axBinary       string
+	staticFS       fs.FS
+	runner         kube.Runner
+	resolveServer  ServerResolver
+	guestExec      GuestExecFunc
+	onListening    func(string)
+	onShutdown     func()
+	hub            *Hub
+	sessionToken   string
+	csrfToken      string
+	sessionExpires time.Time
+
+	rateMu     sync.Mutex
+	rateTokens float64
+	rateLast   time.Time
+
+	opMu           sync.Mutex
+	currentOp      *EnvOpSnapshot
+	opWg           sync.WaitGroup
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+
+	sessMu   sync.Mutex
+	sessions map[string]*liveSession
+}
+
+// NewServer constructs a configured AX Studio server and initializes its
+// ephemeral cryptographic session credentials.
+func NewServer(opts Options) (*Server, error) {
+	addr := strings.TrimSpace(opts.Addr)
+	if addr == "" {
+		addr = DefaultAddr
+	}
+	if err := ValidateLoopbackAddr(addr); err != nil {
+		return nil, err
+	}
+
+	staticFS := opts.StaticFS
+	if staticFS == nil {
+		var err error
+		staticFS, err = StaticFS()
+		if err != nil {
+			return nil, fmt.Errorf("loading embedded studio assets: %w", err)
+		}
+	}
+
+	runner := opts.Runner
+	if runner == nil {
+		runner = kube.OSRunner{}
+	}
+
+	axBin := strings.TrimSpace(opts.AXBinary)
+	if axBin == "" {
+		axBin = kube.ResolveAXBinary(runner)
+	}
+
+	axNS := strings.TrimSpace(opts.AXNamespace)
+	if axNS == "" {
+		axNS = v1alpha1.DefaultSystemNamespace
+	}
+
+	resolver := opts.ResolveServer
+	if resolver == nil {
+		resolver = kube.EnsureServerURL
+	}
+
+	guestExec := opts.GuestExec
+	if guestExec == nil {
+		guestExec = func(ctx context.Context, atespace, taskName, kubeContext, axNamespace string, command []string, cwd string) (string, string, int, error) {
+			execCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+			return kube.ExecInTaskSandbox(execCtx, runner, axBin, atespace, taskName, kubeContext, axNamespace, command, cwd)
+		}
+	}
+
+	sessTok, err := generateSecretHex(32)
+	if err != nil {
+		return nil, fmt.Errorf("generating session secret: %w", err)
+	}
+	csrfTok, err := generateSecretHex(32)
+	if err != nil {
+		return nil, fmt.Errorf("generating CSRF secret: %w", err)
+	}
+
+	shutCtx, shutCancel := context.WithCancel(context.Background())
+
+	return &Server{
+		addr:           addr,
+		axNamespace:    axNS,
+		axBinary:       axBin,
+		staticFS:       staticFS,
+		runner:         runner,
+		resolveServer:  resolver,
+		guestExec:      guestExec,
+		onListening:    opts.OnListening,
+		onShutdown:     opts.OnShutdown,
+		hub:            NewHub(),
+		sessionToken:   sessTok,
+		csrfToken:      csrfTok,
+		sessionExpires: time.Now().Add(sessionTTL),
+		rateTokens:     400,
+		rateLast:       time.Now(),
+		shutdownCtx:    shutCtx,
+		shutdownCancel: shutCancel,
+		sessions:       make(map[string]*liveSession),
+	}, nil
+}
+
+// ValidateLoopbackAddr ensures AX Studio never binds to 0.0.0.0 or a non-loopback interface.
+func ValidateLoopbackAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", addr, err)
+	}
+	if host == "" {
+		return errors.New("refusing to bind AX Studio to all interfaces; specify 127.0.0.1:<port> or localhost:<port>")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("refusing to bind AX Studio to non-loopback host %q (must be 127.0.0.1, ::1, or localhost)", host)
+	}
+	return nil
+}
+
+func generateSecretHex(numBytes int) (string, error) {
+	buf := make([]byte, numBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// Handler returns the root HTTP handler with security headers, method allow-list,
+// rate limiting, Host/Origin validation, and session/CSRF enforcement.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/api/bootstrap", s.handleBootstrap)
+	mux.HandleFunc("/api/events", s.requireSession(s.hub.serveSSE))
+	mux.HandleFunc("/api/env/status", s.requireSession(s.handleEnvStatus))
+	mux.HandleFunc("/api/env/diagnostics", s.requireSession(s.handleDiagnostics))
+	mux.HandleFunc("/api/env/local/up", s.requireMutatingAuth(s.handleLocalUp))
+	mux.HandleFunc("/api/env/local/stop", s.requireMutatingAuth(s.handleLocalAction("stop")))
+	mux.HandleFunc("/api/env/local/delete", s.requireMutatingAuth(s.handleLocalAction("delete")))
+	mux.HandleFunc("/api/env/install", s.requireMutatingAuth(s.handleRemoteInstall))
+	mux.HandleFunc("/api/env/context", s.requireMutatingAuth(s.handleSelectContext))
+	mux.HandleFunc("/api/secrets/credential", s.requireMutatingAuth(s.handleCreateCredentialSecret))
+	mux.HandleFunc("/api/tasks/changes", s.requireSession(s.handleTaskChanges))
+	mux.HandleFunc("/api/tasks/discard-file", s.requireMutatingAuth(s.handleDiscardFile))
+	mux.HandleFunc("/api/tasks/apply-local", s.requireMutatingAuth(s.handleApplyLocal))
+	mux.HandleFunc("/api/tasks/push-branch", s.requireMutatingAuth(s.handlePushBranch))
+	mux.HandleFunc("/api/ax/exec", s.requireMutatingAuth(s.handleAXExec))
+	mux.HandleFunc("/api/sessions/start", s.requireMutatingAuth(s.handleSessionStart))
+	mux.HandleFunc("/api/sessions/write", s.requireMutatingAuth(s.handleSessionWrite))
+	mux.HandleFunc("/api/sessions/interrupt", s.requireMutatingAuth(s.handleSessionInterrupt))
+	mux.HandleFunc("/api/sessions/eof", s.requireMutatingAuth(s.handleSessionEOF))
+	mux.HandleFunc("/api/sessions/close", s.requireMutatingAuth(s.handleSessionClose))
+	mux.Handle("/", s.serveSPA())
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setSecurityHeaders(w, strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz")
+
+		// Strict HTTP method allow-list (GET, HEAD, and POST only).
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Mitigate DNS rebinding by rejecting non-loopback Host headers.
+		if !isLoopbackHostHeader(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+
+		// Reject cross-origin browser requests (strict same-origin loopback check).
+		if origin := r.Header.Get("Origin"); origin != "" && !isLoopbackOrigin(origin) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+
+		if strings.HasPrefix(r.URL.Path, "/api/") && !s.allowRate() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// ListenAndServe starts the loopback HTTP server until ctx is cancelled.
+func (s *Server) ListenAndServe(ctx context.Context) (string, error) {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return "", fmt.Errorf("listening on %s: %w", s.addr, err)
+	}
+	boundURL := "http://" + ln.Addr().String()
+	if s.onListening != nil {
+		s.onListening(boundURL)
+	}
+
+	httpSrv := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+		}
+		close(errCh)
+	}()
+
+	select {
+	case <-ctx.Done():
+		if s.onShutdown != nil {
+			s.onShutdown()
+		}
+		s.gracefulCleanup()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutCtx)
+		return boundURL, nil
+	case serveErr := <-errCh:
+		s.gracefulCleanup()
+		return boundURL, serveErr
+	}
+}
+
+func (s *Server) gracefulCleanup() {
+	if s.shutdownCancel != nil {
+		s.shutdownCancel()
+	}
+	s.closeAllSessions()
+	done := make(chan struct{})
+	go func() {
+		s.opWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
+}
+
+func (s *Server) closeAllSessions() {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	for id, sess := range s.sessions {
+		_ = sess.stdin.Close()
+		if sess.cmd.Process != nil {
+			_ = sess.cmd.Process.Kill()
+		}
+		delete(s.sessions, id)
+	}
+}
+
+func setSecurityHeaders(w http.ResponseWriter, noStore bool) {
+	// TODO(security): `style-src 'self' 'unsafe-inline'` is required for React
+	// component `style={{...}}` attributes and @xterm/xterm viewport sizing;
+	// `script-src 'self'` strictly blocks all inline scripts and eval.
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	if noStore {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+}
+
+func isLoopbackHostHeader(hostport string) bool {
+	if hostport == "" {
+		return false
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	return isLoopbackHostHeader(u.Host)
+}
+
+func (s *Server) allowRate() bool {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(s.rateLast).Seconds()
+	s.rateLast = now
+	s.rateTokens += elapsed * 200.0
+	if s.rateTokens > 400.0 {
+		s.rateTokens = 400.0
+	}
+	if s.rateTokens < 1.0 {
+		return false
+	}
+	s.rateTokens -= 1.0
+	return true
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if time.Now().After(s.sessionExpires) {
+		newSess, err1 := generateSecretHex(32)
+		newCSRF, err2 := generateSecretHex(32)
+		if err1 == nil && err2 == nil {
+			s.sessionToken = newSess
+			s.csrfToken = newCSRF
+			s.sessionExpires = time.Now().Add(sessionTTL)
+		}
+	}
+
+	// TODO(security): Cookie `Secure` and `__Host-` prefix require HTTPS; on plain
+	// http://127.0.0.1 loopback (RFC 6265bis trustworthy origin), `Secure` is set
+	// automatically whenever TLS is present while `HttpOnly` + `SameSite=Strict`
+	// are always enforced.
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    s.sessionToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+
+	home, _ := os.UserHomeDir()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"csrfToken":     s.csrfToken,
+		"os":            runtime.GOOS,
+		"home":          home,
+		"pathSeparator": string(filepath.Separator),
+		"axNamespace":   s.axNamespace,
+		"version":       "v1alpha1",
+	})
+}
+
+func (s *Server) hasValidSession(r *http.Request) bool {
+	if time.Now().After(s.sessionExpires) {
+		return false
+	}
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.sessionToken)) == 1
+}
+
+func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.hasValidSession(r) {
+			writeError(w, http.StatusUnauthorized, "unauthorized studio session; reload page")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) requireMutatingAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.hasValidSession(r) {
+			writeError(w, http.StatusUnauthorized, "unauthorized studio session; reload page")
+			return
+		}
+		presentedCSRF := r.Header.Get(csrfHeaderName)
+		if presentedCSRF == "" || subtle.ConstantTimeCompare([]byte(presentedCSRF), []byte(s.csrfToken)) != 1 {
+			writeError(w, http.StatusForbidden, "missing or invalid CSRF token")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) serveSPA() http.Handler {
+	fileServer := http.FileServer(http.FS(s.staticFS))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cleanPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), "/")
+		if cleanPath == "" || cleanPath == "." {
+			cleanPath = "index.html"
+		}
+		if f, err := s.staticFS.Open(cleanPath); err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		if f, err := s.staticFS.Open("index.html"); err == nil {
+			_ = f.Close()
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			fileServer.ServeHTTP(w, r2)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "<!doctype html><html><head><title>AX Studio</title></head><body><h1>AX Studio</h1><p>Frontend bundle not built; run <code>make build</code>.</p></body></html>")
+	})
+}
+
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("empty request body")
+	}
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxJSONBodyBytes))
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, code int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
