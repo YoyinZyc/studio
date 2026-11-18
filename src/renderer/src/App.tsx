@@ -5,7 +5,7 @@ import logo from './assets/axel.svg'
 import { designer } from './model/designer'
 import { type AXContext, comparePhase, phaseLabel, shortName } from './model/resources'
 import type { TraySummary } from '@shared/api'
-import { PulseDot } from './components'
+import { PulseDot, Tips } from './components'
 import { Overview } from './views/Overview'
 import { Designer } from './views/Designer'
 import { Clusters } from './views/Clusters'
@@ -16,7 +16,7 @@ const SECTIONS: { id: Section; title: string; icon: LucideIcon; group: 'Overview
   { id: 'overview', title: 'Activity', icon: Gauge, group: 'Overview' },
   { id: 'designer', title: 'Deploy', icon: SquarePen, group: 'Build' },
   { id: 'terminal', title: 'Terminal', icon: SquareTerminal, group: 'Build' },
-  { id: 'clusters', title: 'Clusters', icon: Boxes, group: 'Build' },
+  { id: 'clusters', title: 'Environments', icon: Boxes, group: 'Build' },
 ]
 
 export function App() {
@@ -53,6 +53,7 @@ export function App() {
 
   return (
     <div className="shell">
+      <Tips />
       <aside className="sidebar">
         <div className="titlebar-drag sidebar-top" />
         <nav>
