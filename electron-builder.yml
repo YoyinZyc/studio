@@ -7,12 +7,16 @@ files:
   - out/**
   - package.json
 asar: true
+# One naming scheme on every OS, without the space in the product name.
+artifactName: ax-studio-${version}-${os}-${arch}.${ext}
 mac:
   category: public.app-category.developer-tools
   icon: build-resources/icon.icns
   target:
     - target: dmg
+      arch: [arm64, x64]
     - target: zip
+      arch: [arm64, x64]
   # Ad-hoc signed; set CSC_LINK / CSC_KEY_PASSWORD to sign with a real identity.
   identity: null
 win:

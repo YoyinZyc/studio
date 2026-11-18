@@ -58,6 +58,26 @@ Build each OS on that OS. macOS builds are unsigned; set `mac.identity` in
 swift scripts/make-icon.swift ~/ax/assets/axel.svg build-resources/icon.icns
 ```
 
+## Release
+
+Push a version tag and [the Release workflow](.github/workflows/release.yml)
+builds the app on macOS, Windows and Linux and publishes one GitHub release
+with every installer and a `checksums.txt`:
+
+```sh
+git tag v0.0.1-test
+git push origin v0.0.1-test
+```
+
+The app's version comes from the tag, not `package.json`. A tag with a `-`,
+like the one above, is published as a prerelease. To try the build without
+publishing, run the workflow by hand from the Actions tab; the installers are
+kept as workflow artifacts.
+
+The builds aren't signed yet. On macOS, clear the quarantine flag after
+installing: `xattr -cr "/Applications/AX Studio.app"`. On Windows, SmartScreen
+warns before the installer runs.
+
 ## Environments
 
 The Environments page drives `ax`. It checks this machine, then offers two

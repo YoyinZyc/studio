@@ -1,0 +1,126 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Pushing a vX.Y.Z[-PRERELEASE] tag builds the desktop app on macOS, Windows
+# and Linux, then publishes one GitHub release with every installer and a
+# checksums.txt. The app's version comes from the tag, so package.json doesn't
+# need a commit per release. A tag with a "-" (v0.0.5-test) is a prerelease.
+#
+# A manual run builds the installers and keeps them as workflow artifacts,
+# without publishing anything.
+#
+# The builds are unsigned. See "Release" in README.md.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # electron-builder builds for the OS it runs on. macos-latest is Apple
+        # silicon and builds both arm64 and x64 (see electron-builder.yml).
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npx electron-vite build
+
+      - name: Package
+        env:
+          # No signing identity yet; don't search the keychain for one.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          args=(--publish never)
+          if [ "$REF_TYPE" = "tag" ]; then
+            args+=("-c.extraMetadata.version=${GITHUB_REF_NAME#v}")
+          fi
+          npx electron-builder "${args[@]}"
+          ls -lh dist/
+
+      - name: Upload installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.tar.gz
+
+  release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      actions: read   # download this run's artifacts
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Collect installers
+        run: |
+          gh run download "$GITHUB_RUN_ID" --dir artifacts
+          mkdir assets
+          mv artifacts/*/* assets/
+          (cd assets && sha256sum -- * > checksums.txt)
+          ls -lh assets/
+          cat assets/checksums.txt
+
+      - name: Publish
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+            exit 0
+          fi
+          flags=(--title "AX Studio $TAG" --generate-notes --verify-tag)
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" assets/* "${flags[@]}"
