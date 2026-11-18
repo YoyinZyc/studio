@@ -3,6 +3,11 @@
   "productName": "AX Studio",
   "version": "0.1.0",
   "description": "Deploy, design and visualize AX tasks",
+  "homepage": "https://github.com/agentexecutor/studio",
+  "author": {
+    "name": "Yuchen Zhou",
+    "email": "yoyinzyc@gmail.com"
+  },
   "main": "out/main/index.js",
   "license": "Apache-2.0",
   "scripts": {
