@@ -32,12 +32,20 @@ const home = homedir()
  * kind. The installer doesn't add it to PATH, so look there ourselves.
  */
 const axBin = join(process.env.AX_HOME || join(home, '.ax'), 'bin')
+/**
+ * The `ax` packaged with the app (see scripts/fetch-ax.sh). It goes first on
+ * PATH so the app runs the version it was built against, whatever else is
+ * installed; a full path in Settings still overrides it. Unpackaged runs and
+ * Windows builds have no such directory and fall through to PATH.
+ */
+const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
+const bundledBin = resources ? join(resources, 'bin') : ''
 const extra = isWin
   ? [axBin, join(home, 'go', 'bin'), join(home, 'scoop', 'shims')]
   : [axBin, join(home, 'go', 'bin'), join(home, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/local/go/bin',
      join(home, 'google-cloud-sdk', 'bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin']
 
-const PATH = [...new Set([...loginPath().split(delimiter), ...extra].filter(Boolean))].join(delimiter)
+const PATH = [...new Set([bundledBin, ...loginPath().split(delimiter), ...extra].filter(Boolean))].join(delimiter)
 
 export const env: NodeJS.ProcessEnv = { ...process.env, PATH }
 

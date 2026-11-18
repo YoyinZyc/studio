@@ -65,6 +65,9 @@ jobs:
       - name: Build
         run: npx electron-vite build
 
+      - name: Fetch the ax CLI to package
+        run: bash scripts/fetch-ax.sh
+
       - name: Package
         env:
           # No signing identity yet; don't search the keychain for one.

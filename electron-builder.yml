@@ -7,6 +7,11 @@ files:
   - out/**
   - package.json
 asar: true
+# The ax CLI for the platform being packaged, fetched by scripts/fetch-ax.sh.
+# It lands in the app's resources/bin, which the app puts first on PATH.
+extraResources:
+  - from: vendor/ax/${os}-${arch}
+    to: bin
 # One naming scheme on every OS, without the space in the product name.
 artifactName: ax-studio-${version}-${os}-${arch}.${ext}
 mac:

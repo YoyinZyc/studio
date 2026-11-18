@@ -23,6 +23,11 @@ The app calls the `ax` CLI and `kubectl`. It passes `--context` on every call,
 so browsing and managing tasks never changes your global context. Creating or
 starting a local cluster does: `ax local start` makes that cluster current.
 
+The macOS and Linux installers include `ax`, and the app uses that copy unless
+Settings names another. The release it comes from is pinned in
+[fetch-ax.sh](scripts/fetch-ax.sh). AX has no Windows build, so on Windows the
+app uses the `ax` on your PATH.
+
 ## Develop
 
 ```sh
@@ -31,9 +36,9 @@ npm run dev         # hot-reloading app
 npm run typecheck
 ```
 
-The app uses the `ax` on your PATH or in `~/.ax/bin`. To develop against
-another `ax`, such as one you built from source, set its full path in Settings
-(⌘,).
+`npm run dev` uses the `ax` on your PATH or in `~/.ax/bin`; only packaged
+builds carry their own. To develop against another `ax`, such as one you built
+from source, set its full path in Settings (⌘,).
 
 To refresh a screenshot, build (`npm run build`) and run:
 
@@ -46,6 +51,7 @@ Other flags: `--context`, `--atespace`, `--task`, `--logs=expanded`, `--terminal
 ## Package
 
 ```sh
+scripts/fetch-ax.sh # the ax CLI to include
 npm run dist:mac    # .dmg and .zip
 npm run dist:win    # NSIS installer and .zip
 npm run dist:linux  # AppImage, .deb, .tar.gz

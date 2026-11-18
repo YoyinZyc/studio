@@ -3,3 +3,4 @@ out/
 dist/
 __pycache__/
 /index.html
+vendor/
