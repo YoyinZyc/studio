@@ -67,8 +67,9 @@ swift scripts/make-icon.swift ~/ax/assets/axel.svg build-resources/icon.icns
 ## Release
 
 Push a version tag and [the Release workflow](.github/workflows/release.yml)
-builds the app on macOS, Windows and Linux and publishes one GitHub release
-with every installer and a `checksums.txt`:
+builds the app on macOS, Windows and Linux and publishes the installers to one
+GitHub release. Each OS adds its own, with a `checksums-<os>.txt`, as soon as
+they're built, so a slow or failed one doesn't hold back the others:
 
 ```sh
 git tag v0.0.1-test

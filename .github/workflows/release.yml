@@ -13,9 +13,12 @@
 # limitations under the License.
 
 # Pushing a vX.Y.Z[-PRERELEASE] tag builds the desktop app on macOS, Windows
-# and Linux, then publishes one GitHub release with every installer and a
-# checksums.txt. The app's version comes from the tag, so package.json doesn't
-# need a commit per release. A tag with a "-" (v0.0.5-test) is a prerelease.
+# and Linux and publishes the installers to one GitHub release. Each OS adds
+# its own installers, with a checksums-<os>.txt, as soon as it has built them,
+# so one that fails or waits for a runner doesn't hold back the others.
+# Re-running a failed job adds what's missing. The app's version comes from the
+# tag, so package.json doesn't need a commit per release. A tag with a "-"
+# (v0.0.5-test) is a prerelease.
 #
 # A manual run builds the installers and keeps them as workflow artifacts,
 # without publishing anything.
@@ -32,15 +35,50 @@ permissions:
   contents: read
 
 jobs:
+  release:
+    name: Create GitHub release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      # Created empty and filled in by the build jobs. One that's already
+      # there, from an earlier run or made by hand, is left as it is.
+      - name: Create the release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+          flags=(--title "AX Studio $TAG" --generate-notes --verify-tag)
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" "${flags[@]}"
+
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.name }})
+    needs: release
+    # A manual run skips the release job; build anyway.
+    if: ${{ !cancelled() && !failure() }}
     strategy:
       fail-fast: false
       matrix:
         # electron-builder builds for the OS it runs on. macos-latest is Apple
         # silicon and builds both arm64 and x64 (see electron-builder.yml).
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - { name: mac, os: macos-latest }
+          - { name: windows, os: windows-latest }
+          - { name: linux, os: ubuntu-latest }
     runs-on: ${{ matrix.os }}
+    permissions:
+      # To add installers to the release. The token is given only to the step
+      # that uploads them, not to npm or the build.
+      contents: write
     defaults:
       run:
         shell: bash
@@ -81,49 +119,38 @@ jobs:
           npx electron-builder "${args[@]}"
           ls -lh dist/
 
-      - name: Upload installers
+      - name: Collect installers
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          shopt -s nullglob
+          mkdir assets
+          files=(dist/*.dmg dist/*.zip dist/*.exe dist/*.AppImage dist/*.deb dist/*.tar.gz)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No installers were built." >&2
+            exit 1
+          fi
+          mv "${files[@]}" assets/
+          cd assets
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -- * > "checksums-${NAME}.txt"
+          else
+            shasum -a 256 -- * > "checksums-${NAME}.txt"
+          fi
+          ls -lh
+          cat "checksums-${NAME}.txt"
+
+      - name: Keep installers as workflow artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: installers-${{ matrix.os }}
+          name: installers-${{ matrix.name }}
           if-no-files-found: error
-          path: |
-            dist/*.dmg
-            dist/*.zip
-            dist/*.exe
-            dist/*.AppImage
-            dist/*.deb
-            dist/*.tar.gz
+          path: assets/*
 
-  release:
-    name: Publish GitHub release
-    if: github.ref_type == 'tag'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # create the release
-      actions: read   # download this run's artifacts
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GH_REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
-    steps:
-      - name: Collect installers
-        run: |
-          gh run download "$GITHUB_RUN_ID" --dir artifacts
-          mkdir assets
-          mv artifacts/*/* assets/
-          (cd assets && sha256sum -- * > checksums.txt)
-          ls -lh assets/
-          cat assets/checksums.txt
-
-      - name: Publish
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" assets/* --clobber
-            exit 0
-          fi
-          flags=(--title "AX Studio $TAG" --generate-notes --verify-tag)
-          case "$TAG" in
-            *-*) flags+=(--prerelease) ;;
-          esac
-          gh release create "$TAG" assets/* "${flags[@]}"
+      - name: Add installers to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" assets/* --clobber
