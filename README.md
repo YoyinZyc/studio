@@ -78,10 +78,10 @@ The new UX has no build step. To work on it, serve it from disk so a reload show
 
 ## Release
 
-A release is the `ax-studio` binary for Linux and macOS (amd64 and arm64). Push a version tag and [the Release workflow](.github/workflows/release.yml) tests, builds and publishes `ax-studio_<os>_<arch>.tar.gz` for each platform, with a `checksums.txt`, to a GitHub release for the tag:
+A release is the `ax-studio` binary for Linux and macOS (amd64 and arm64). Tag a commit on `main` (or a `release-*` branch; the workflow refuses any other commit) and push the tag, and [the Release workflow](.github/workflows/release.yml) tests, builds and publishes `ax-studio_<os>_<arch>.tar.gz` for each platform, with a `checksums.txt`, to a GitHub release for the tag:
 
 ```bash
-git tag v0.1.0
+git tag v0.1.0 <commit>
 git push origin v0.1.0
 ```
 
