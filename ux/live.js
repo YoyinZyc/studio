@@ -171,6 +171,8 @@ async function liveConnect() {
   LIVE.phase = 'ready';
   liveCheckAx();
   await liveLoadEnv();
+  /* Show this computer and the kubeconfig now: the first answer from a cluster can take a minute when it's unreachable. */
+  render({ keepScroll: true, background: true });
   /* A link can name the cluster and atespace to open on. */
   if (typeof liveApplyDeepLink === 'function') liveApplyDeepLink();
   await liveRefresh(true);
@@ -259,7 +261,7 @@ async function liveRefresh(force) {
   try {
     const part = parseRoute().parts[0];
     const envPage = part === 'places' || part === 'setup' || !LIVE.context || liveLocalDown();
-    if (envPage && !liveOpRunning() && (force || Date.now() - LIVE.envAt >= LIVE_ENV_MS)) await liveLoadEnv();
+    if (envPage && !liveOpRunning() && (force || Date.now() - LIVE.envAt >= LIVE_ENV_MS)) { await liveLoadEnv(); render({ keepScroll: true, background: true }); }
     const ctx = LIVE.context;
     if (!ctx || liveLocalDown()) {
       /* No cluster yet, or AX on this computer isn't running: there is nothing to ask. Home shows setup instead. */
