@@ -873,7 +873,7 @@ function liveTaskTemplate(spec) {
   const cfg = spec.config || {};
   const model = cfg.model || (cfg.agent && cfg.agent.model) || '';
   if (k) return { id: k, name: LIVE_AGENTS[k].name, tile: agentTile(k, 'sm'), model: model || LIVE_AGENTS[k].model };
-  return { id: '', name: image ? (typeof liveImageShort === 'function' ? liveImageShort(image) : image) : "AX's default task image", tile: byoTile('sm'), model };
+  return { id: '', name: image ? (typeof liveImageShort === 'function' ? liveImageShort(image) : image) : 'No image', tile: byoTile('sm'), model };
 }
 function liveLimitsText(spec) {
   const l = (spec.profile && spec.profile.resources && spec.profile.resources.limits) || {};
