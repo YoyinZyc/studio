@@ -106,8 +106,8 @@ jobs:
             dist/checksums.txt
           if-no-files-found: error
 
-      # A release that already exists, from an earlier run, gets the files
-      # again, so a failed run can be re-run.
+      # A release is never changed once it exists: this fails if the tag
+      # already has one, so the files under a tag stay the same.
       - name: Publish the release
         if: github.ref_type == 'tag'
         env:
@@ -116,10 +116,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           files=(dist/ax-studio_*.tar.gz dist/checksums.txt)
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${files[@]}" --clobber
-            exit 0
-          fi
           flags=(--title "AX Studio $TAG" --generate-notes --verify-tag)
           case "$TAG" in
             *-*) flags+=(--prerelease) ;;
