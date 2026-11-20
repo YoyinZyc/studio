@@ -145,13 +145,16 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), axReadTimeout)
 	defer cancel()
-	resp, err := client.ListTasks(ctx, &v1alpha1.ListTasksRequest{Atespace: atespace, Limit: resourceListLimit})
+	all, err := listAll(func(pageToken string) ([]*v1alpha1.Task, string, error) {
+		resp, err := client.ListTasks(ctx, &v1alpha1.ListTasksRequest{Atespace: atespace, PageSize: listPageSize, PageToken: pageToken})
+		return resp.GetTasks(), resp.GetNextPageToken(), err
+	})
 	if err != nil {
 		writeAXError(w, err)
 		return
 	}
-	tasks := make([]json.RawMessage, 0, len(resp.GetTasks()))
-	for _, t := range resp.GetTasks() {
+	tasks := make([]json.RawMessage, 0, len(all))
+	for _, t := range all {
 		b, err := taskJSON.Marshal(t)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("encoding task: %v", err))

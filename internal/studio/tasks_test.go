@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,7 +48,31 @@ type taskStubServer struct {
 	tasks      map[string]*v1alpha1.Task
 	gateways   map[string]*v1alpha1.Gateway
 	workspaces map[string]*v1alpha1.Workspace
-	listLimit  int64 // the limit the last ListTasks asked for
+	models     []*v1alpha1.Model // nil is one model, gemini-flash
+	pageSize   int32             // the page size the last List asked for
+	maxPage    int               // if set, the most a List returns in one page
+}
+
+// stubPage returns the page of items that starts at pageToken, in name order,
+// and the token of the page after it. The caller holds s.mu.
+func stubPage[T interface{ GetMetadata() *v1alpha1.ObjectMeta }](s *taskStubServer, items []T, pageSize int32, pageToken string) ([]T, string, error) {
+	s.pageSize = pageSize
+	sort.Slice(items, func(i, j int) bool { return items[i].GetMetadata().GetName() < items[j].GetMetadata().GetName() })
+	offset := 0
+	if pageToken != "" {
+		var err error
+		if offset, err = strconv.Atoi(pageToken); err != nil || offset > len(items) {
+			return nil, "", status.Error(codes.InvalidArgument, "invalid page_token")
+		}
+	}
+	size := int(pageSize)
+	if s.maxPage > 0 && (size == 0 || size > s.maxPage) {
+		size = s.maxPage
+	}
+	if size == 0 || offset+size >= len(items) {
+		return items[offset:], "", nil
+	}
+	return items[offset : offset+size], strconv.Itoa(offset + size), nil
 }
 
 func (s *taskStubServer) GetGateway(_ context.Context, req *v1alpha1.GetGatewayRequest) (*v1alpha1.Gateway, error) {
@@ -70,14 +96,14 @@ func (s *taskStubServer) find(atespace, name string) (*v1alpha1.Task, error) {
 func (s *taskStubServer) ListTasks(_ context.Context, req *v1alpha1.ListTasksRequest) (*v1alpha1.ListTasksResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := &v1alpha1.ListTasksResponse{}
-	s.listLimit = req.GetLimit()
+	var all []*v1alpha1.Task
 	for _, t := range s.tasks {
 		if t.GetMetadata().GetAtespace() == req.GetAtespace() {
-			resp.Tasks = append(resp.Tasks, t)
+			all = append(all, t)
 		}
 	}
-	return resp, nil
+	page, next, err := stubPage(s, all, req.GetPageSize(), req.GetPageToken())
+	return &v1alpha1.ListTasksResponse{Tasks: page, NextPageToken: next}, err
 }
 
 func (s *taskStubServer) GetTask(_ context.Context, req *v1alpha1.GetTaskRequest) (*v1alpha1.Task, error) {

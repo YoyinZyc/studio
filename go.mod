@@ -3,7 +3,7 @@ module github.com/agentexecutor/studio
 go 1.27.1
 
 require (
-	github.com/google/ax v0.3.2-0.20261118234833-f35661116010
+	github.com/google/ax v0.3.2-0.20261119222922-749fa9c536a0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
