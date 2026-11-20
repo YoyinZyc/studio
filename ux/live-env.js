@@ -150,6 +150,8 @@ function liveDuration(ms) { return fmtElapsed(Date.now() - Math.max(0, ms)); }
 /* Clear in the Output panel hides the lines that were there: { id: operation, n: lines hidden }. */
 LIVE.outClear = null;
 let liveOpPaintTimer = 0;
+/* The operation and stage the layers were last drawn for by liveOpPaint. */
+let liveLayersStage = '';
 
 /* ---------- Setup in progress ---------- */
 function liveOpRunning() { return !!(LIVE.op && LIVE.op.status === 'running'); }
@@ -228,6 +230,12 @@ function liveOpPaint() {
   /* Only Where agents run has the Output panel, and it lists the layers, so it needs neither here. */
   if (box) box.innerHTML = liveOpInnerHTML({ log: !out, stones: !out });
   if (out) out.innerHTML = liveOutputInnerHTML();
+  /* The layers show which stage setup is at: redraw them when it moves on (not on every line, so the spinner keeps
+     turning). */
+  const layers = $('#live-layers');
+  const stage = LIVE.op ? `${LIVE.op.id}:${LIVE.op.stage}` : '';
+  if (layers && stage !== liveLayersStage) layers.outerHTML = liveLayersHTML();
+  liveLayersStage = stage;
   const log2 = $('#live-op-log');
   if (log2) log2.scrollTop = stuck ? log2.scrollHeight : at;
 }

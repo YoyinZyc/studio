@@ -32,23 +32,37 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// resourceListLimit is how many Workspaces (or Tasks) one list asks for;
-// ax-server's own default is 50.
-const resourceListLimit = 500
+// listPageSize is how many resources one List call asks for. ax-server's own
+// default is 50, and it returns at most 1000.
+const listPageSize = 500
+
+// listAll returns every resource of a list, following next page tokens until
+// the last page, as `ax get` does.
+func listAll[T proto.Message](list func(pageToken string) (page []T, nextPageToken string, err error)) ([]proto.Message, error) {
+	var all []proto.Message
+	for pageToken := ""; ; {
+		page, next, err := list(pageToken)
+		if err != nil {
+			return nil, err
+		}
+		for _, x := range page {
+			all = append(all, x)
+		}
+		if next == "" {
+			return all, nil
+		}
+		pageToken = next
+	}
+}
 
 // handleListWorkspaces serves GET /api/workspaces?context=&atespace=:
 // {"workspaces": [Workspace]}.
 func (s *Server) handleListWorkspaces(w http.ResponseWriter, r *http.Request) {
 	s.listResources(w, r, "workspaces", func(ctx context.Context, c v1alpha1.AXClient, atespace string) ([]proto.Message, error) {
-		resp, err := c.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace, Limit: resourceListLimit})
-		if err != nil {
-			return nil, err
-		}
-		out := make([]proto.Message, 0, len(resp.GetWorkspaces()))
-		for _, x := range resp.GetWorkspaces() {
-			out = append(out, x)
-		}
-		return out, nil
+		return listAll(func(pageToken string) ([]*v1alpha1.Workspace, string, error) {
+			resp, err := c.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace, PageSize: listPageSize, PageToken: pageToken})
+			return resp.GetWorkspaces(), resp.GetNextPageToken(), err
+		})
 	})
 }
 
@@ -56,30 +70,20 @@ func (s *Server) handleListWorkspaces(w http.ResponseWriter, r *http.Request) {
 // {"gateways": [Gateway]}.
 func (s *Server) handleListGateways(w http.ResponseWriter, r *http.Request) {
 	s.listResources(w, r, "gateways", func(ctx context.Context, c v1alpha1.AXClient, atespace string) ([]proto.Message, error) {
-		resp, err := c.ListGateways(ctx, &v1alpha1.ListGatewaysRequest{Atespace: atespace})
-		if err != nil {
-			return nil, err
-		}
-		out := make([]proto.Message, 0, len(resp.GetGateways()))
-		for _, x := range resp.GetGateways() {
-			out = append(out, x)
-		}
-		return out, nil
+		return listAll(func(pageToken string) ([]*v1alpha1.Gateway, string, error) {
+			resp, err := c.ListGateways(ctx, &v1alpha1.ListGatewaysRequest{Atespace: atespace, PageSize: listPageSize, PageToken: pageToken})
+			return resp.GetGateways(), resp.GetNextPageToken(), err
+		})
 	})
 }
 
 // handleListModels serves GET /api/models?context=&atespace=: {"models": [Model]}.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	s.listResources(w, r, "models", func(ctx context.Context, c v1alpha1.AXClient, atespace string) ([]proto.Message, error) {
-		resp, err := c.ListModels(ctx, &v1alpha1.ListModelsRequest{Atespace: atespace})
-		if err != nil {
-			return nil, err
-		}
-		out := make([]proto.Message, 0, len(resp.GetModels()))
-		for _, x := range resp.GetModels() {
-			out = append(out, x)
-		}
-		return out, nil
+		return listAll(func(pageToken string) ([]*v1alpha1.Model, string, error) {
+			resp, err := c.ListModels(ctx, &v1alpha1.ListModelsRequest{Atespace: atespace, PageSize: listPageSize, PageToken: pageToken})
+			return resp.GetModels(), resp.GetNextPageToken(), err
+		})
 	})
 }
 
